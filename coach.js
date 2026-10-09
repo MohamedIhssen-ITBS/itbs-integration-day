@@ -1,31 +1,100 @@
 'use strict';
-const cfg=window.ITBS_CONFIG,$=id=>document.getElementById(id),esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));let token='',rows=[],sessionGeneration=0,idleTimer,expiryTimer;let lastActivity=0;const hour=m=>`${Math.floor(m/60)}:${String(m%60).padStart(2,'0')}`;
-async function request(path,body){const generation=sessionGeneration;const r=await fetch(cfg.supabaseUrl.replace(/\/$/,'')+path,{method:'POST',cache:'no-store',...(typeof AbortSignal!=='undefined'&&AbortSignal.timeout?{signal:AbortSignal.timeout(15000)}:{}),headers:{apikey:cfg.supabaseKey,'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})},body:JSON.stringify(body)});const raw=await r.text();let v=null;try{v=raw?JSON.parse(raw):null}catch{throw Error('Réponse du serveur illisible. Réessayez.');}if(generation!==sessionGeneration)throw Error('Session fermée. Reconnectez-vous.');if(r.status===401&&token)clearSession('Votre session a expiré. Reconnectez-vous.');if(!r.ok)throw Error(v?.message||v?.msg||'Connexion impossible.');return v}
-$('login').onsubmit=async e=>{e.preventDefault();$('error').textContent='';const b=e.target.querySelector('button');b.disabled=true;try{if(!cfg.supabaseUrl||!cfg.supabaseKey)throw Error('Connexion momentanément indisponible. Contactez l’organisateur.');const f=new FormData(e.target),v=await request('/auth/v1/token?grant_type=password',{email:f.get('email'),password:f.get('password')});token=v.access_token;e.target.reset();armSession(v.expires_in);await load();$('login').hidden=true;$('dashboard').hidden=false;}catch(e){clearSession();$('error').textContent=e.message}finally{e.target.reset();b.disabled=false}};
-async function load(){rows=await request('/rest/v1/rpc/coach_list',{});const old=$('activity').value,oldSlot=$('slot').value;$('activity').innerHTML='<option value="">Toutes mes activités</option>'+[...new Set(rows.map(r=>r.activity))].map(a=>`<option>${esc(a)}</option>`).join('');$('activity').value=old;$('slot').innerHTML='<option value="">Tous les créneaux</option>'+[...new Set(rows.map(r=>r.start))].sort((a,b)=>a-b).map(s=>`<option value="${s}">${hour(s)}</option>`).join('');$('slot').value=oldSlot;draw();$('status').textContent='Liste actualisée à '+new Date().toLocaleTimeString('fr-FR');}
-function filtered(){return rows.filter(r=>(!$('activity').value||r.activity===$('activity').value)&&(!$('slot').value||r.start===Number($('slot').value)))}
-function draw(){$('rows').innerHTML=filtered().map(r=>`<tr><td><b>${esc(r.first_name)} ${esc(r.last_name)}</b><br>${esc(r.email)}</td><td><div class="attendance-buttons" role="group" aria-label="Présence de ${esc(r.first_name+' '+r.last_name)}">${[['present','P','Présent',true],['absent','A','Absent',false],['unmarked','—','Non renseigné',null]].map(([value,label,title,state])=>`<button type="button" class="attendance-button ${value}" data-id="${r.id}" data-state="${value}" aria-label="${title}" title="${title}" aria-pressed="${state===null?r.present==null:r.present===state}">${label}</button>`).join('')}</div></td><td>${esc(r.phone||'—')}</td><td>${esc(r.activity)}</td><td>${hour(r.start)}–${hour(r.end)}</td></tr>`).join('');$('stats').textContent=`${filtered().length} réservation(s) · ${filtered().filter(r=>r.present===true).length} présent(s) · ${filtered().filter(r=>r.present===false).length} absent(s) · ${filtered().filter(r=>r.present==null).length} non renseigné(s)`;}
-
-$('activity').onchange=()=>{stopScanner();draw()};$('slot').onchange=()=>{stopScanner();draw()};$('refresh').onclick=()=>load().catch(e=>$('error').textContent=e.message);$('logout').onclick=()=>clearSession('Vous êtes déconnecté.');
-const pendingAttendance=new Set();
-$('rows').onclick=async e=>{const el=e.target.closest('button[data-state]');if(!el||scanSubmitting)return;const id=Number(el.dataset.id),row=rows.find(r=>r.id===id);if(!row||pendingAttendance.has(id))return;const next=el.dataset.state==='present'?true:el.dataset.state==='absent'?false:null;if(row.present===next)return;pendingAttendance.add(id);const buttons=el.parentElement.querySelectorAll('button');buttons.forEach(b=>b.disabled=true);$('error').textContent='';try{await request('/rest/v1/rpc/mark_present',{p_id:id,p_present:next});const current=rows.find(r=>r.id===id);if(current)current.present=next;draw()}catch(e){$('error').textContent=e.message}finally{pendingAttendance.delete(id);buttons.forEach(b=>b.disabled=false)}};
-$('export').onclick=()=>{const safe=v=>'"'+String(v??'').replace(/^(?:[\s]*[=+@\-]|[\t\r\n])/,"'"+'$&').replaceAll('"','""')+'"';const values=[['Prénom','Nom','Email','Téléphone','Activité','Début','Fin','Présence'],...filtered().map(r=>[r.first_name,r.last_name,r.email,r.phone,r.activity,hour(r.start),hour(r.end),r.present===true?'Présent':r.present===false?'Absent':''])];const url=URL.createObjectURL(new Blob(['\ufeff'+values.map(r=>r.map(safe).join(';')).join('\r\n')],{type:'text/csv;charset=utf-8'})),a=document.createElement('a');a.href=url;a.download='ITBS-participants.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),5000)};
-
-function clearSession(message=''){
- stopScanner();sessionGeneration++;token='';rows=[];clearTimeout(idleTimer);clearTimeout(expiryTimer);
- $('rows').innerHTML='';$('activity').innerHTML='';$('slot').innerHTML='';$('stats').textContent='';
- $('dashboard').hidden=true;$('login').hidden=false;$('login').reset();$('status').textContent=message;$('scan-result').textContent='';
-}
-function touchSession(){
- if(!token)return;
- if(lastActivity&&Date.now()-lastActivity>=15*60*1000){clearSession('Session fermée après 15 minutes d’inactivité.');return;}
- lastActivity=Date.now();clearTimeout(idleTimer);idleTimer=setTimeout(()=>clearSession('Session fermée après 15 minutes d’inactivité.'),15*60*1000);
-}
-function armSession(seconds){lastActivity=0;touchSession();clearTimeout(expiryTimer);expiryTimer=setTimeout(()=>clearSession('Votre session a expiré. Reconnectez-vous.'),Math.max(1,Number(seconds)||3600)*1000);}
-['pointerdown','keydown'].forEach(event=>document.addEventListener(event,touchSession,{passive:true}));
-window.addEventListener('pagehide',()=>clearSession());
-
+const cfg=window.ITBS_CONFIG,$=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const hour=m=>`${Math.floor(m/60)}:${String(m%60).padStart(2,'0')}`,PAGE_SIZE=15,STORAGE_KEY='itbs-team-session-v2',PREFERENCE_KEY='itbs-team-remember';
+let token='',userId='',rows=[],schedule=[],page=1,sessionGeneration=0,writeVersion=0,loading=false,dirty=false,pollTimer,loadTimer,channel=null,realtimeReady=false,lastSync=0,blockedSession=false;
 let cameraStream=null,scanEpoch=0,scanFrame=0,scanSubmitting=false;
+const pendingAttendance=new Set(),memoryStorage=new Map();
+const safeStorage=(store,method,...args)=>{try{return window[store][method](...args)}catch{return null}};
+let remember=safeStorage('localStorage','getItem',PREFERENCE_KEY)==='true';$('remember').checked=remember;
+const storage={getItem:key=>safeStorage(remember?'localStorage':'sessionStorage','getItem',key)||memoryStorage.get(key)||null,setItem(key,value){memoryStorage.set(key,value);safeStorage(remember?'localStorage':'sessionStorage','setItem',key,value)},removeItem(key){memoryStorage.delete(key);safeStorage('localStorage','removeItem',key);safeStorage('sessionStorage','removeItem',key)}};
+const client=window.ITBSCreateClient(cfg.supabaseUrl,cfg.supabaseKey,{auth:{storage,storageKey:STORAGE_KEY,persistSession:true,autoRefreshToken:true,detectSessionInUrl:false}});
+function setSync(){const offline=typeof navigator!=='undefined'&&navigator.onLine===false;const badge=$('sync-indicator');badge.dataset.state=offline?'offline':realtimeReady?'live':'fallback';badge.textContent=offline?'Hors connexion':realtimeReady?'● En direct':'Actualisation auto';}
+async function request(path,body){
+ const generation=sessionGeneration,name=path.split('/').pop();let query=client.rpc(name,body);
+ if(typeof AbortSignal!=='undefined'&&AbortSignal.timeout)query=query.abortSignal(AbortSignal.timeout(15000));
+ const {data,error}=await query;if(generation!==sessionGeneration)throw Error('Session fermée. Reconnectez-vous.');if(error)throw error;return data;
+}
+function filtered(){return rows.filter(r=>r.activity===$('activity').value&&(!$('slot').value||r.slot_id===$('slot').value))}
+function rebuildFilters(){
+ const oldActivity=$('activity').value,oldSlot=$('slot').value,activities=[...new Set(schedule.map(s=>s.activity))];
+ const activity=activities.includes(oldActivity)?oldActivity:activities.includes('Golf')?'Golf':activities[0]||'';
+ const html=activities.map(a=>`<option value="${esc(a)}">${esc(a)}</option>`).join('');if($('activity').innerHTML!==html)$('activity').innerHTML=html;$('activity').value=activity;
+ const slots=schedule.filter(s=>s.activity===activity),slotHTML='<option value="">Tous les créneaux</option>'+slots.map(s=>`<option value="${esc(s.id)}">${hour(s.start)} – ${hour(s.end)}</option>`).join('');
+ if($('slot').innerHTML!==slotHTML)$('slot').innerHTML=slotHTML;$('slot').value=slots.some(s=>s.id===oldSlot)?oldSlot:'';
+ if(activity!==oldActivity||$('slot').value!==oldSlot){page=1;stopScanner();}
+}
+function draw(){
+ const list=filtered(),pages=Math.max(1,Math.ceil(list.length/PAGE_SIZE));page=Math.max(1,Math.min(page,pages));
+ const html=list.slice((page-1)*PAGE_SIZE,page*PAGE_SIZE).map(r=>`<tr><td>${esc(r.first_name)} ${esc(r.last_name)}</td><td><div class="attendance-buttons" role="group" aria-label="Présence de ${esc(r.first_name+' '+r.last_name)}">${[['present','P','Présent',true],['absent','A','Absent',false],['unmarked','—','Non renseigné',null]].map(([value,label,title,state])=>`<button type="button" class="attendance-button ${value}" data-id="${r.id}" data-state="${value}" aria-label="${title}" title="${title}" ${pendingAttendance.has(r.id)||scanSubmitting?'disabled':''} aria-pressed="${state===null?r.present==null:r.present===state}">${label}</button>`).join('')}</div></td></tr>`).join('')||'<tr><td colspan="2" class="empty-table">Aucun participant pour cette sélection.</td></tr>';
+ if($('rows').innerHTML!==html){const focus=document.activeElement?.dataset;$('rows').innerHTML=html;if(focus?.id&&focus?.state)$('rows').querySelector(`[data-id="${Number(focus.id)}"][data-state="${focus.state}"]`)?.focus({preventScroll:true});}
+ $('stats').innerHTML=`<span>${list.length} participant${list.length>1?'s':''}</span><span>${list.filter(r=>r.present===true).length} présent(s)</span><span>${list.filter(r=>r.present===false).length} absent(s)</span><span>${list.filter(r=>r.present==null).length} non renseigné(s)</span>`;
+ $('page-info').textContent=list.length?`${(page-1)*PAGE_SIZE+1}–${Math.min(page*PAGE_SIZE,list.length)} sur ${list.length} · ${page}/${pages}`:'0 participant';$('previous').disabled=page<=1;$('next').disabled=page>=pages;
+}
+function queueLoad(delay=100){if(!token||document.hidden)return;dirty=true;clearTimeout(loadTimer);loadTimer=setTimeout(()=>void load(),delay);}
+function armPoll(){clearTimeout(pollTimer);if(token&&!document.hidden)pollTimer=setTimeout(()=>void load(),realtimeReady?10000:3000);}
+async function load(){
+ if(!token||document.hidden)return;if(loading||pendingAttendance.size||scanSubmitting){dirty=true;return;}
+ const generation=sessionGeneration,version=writeVersion;loading=true;dirty=false;$('refresh').disabled=true;
+ try{
+  const data=await request('/rest/v1/rpc/coach_snapshot',{});if(generation!==sessionGeneration)return;
+  if(version!==writeVersion||pendingAttendance.size||scanSubmitting){dirty=true;return;}
+  if(!data||!Array.isArray(data.rows)||!Array.isArray(data.slots))throw Error('Liste reçue incomplète. Réessayez.');
+  rows=data.rows;schedule=data.slots;rebuildFilters();draw();lastSync=Date.now();$('sync-time').textContent='Mis à jour à '+new Date(lastSync).toLocaleTimeString('fr-FR');$('status').textContent='';setSync();
+ }catch(e){if(generation===sessionGeneration){if(/Aucun accès/.test(e.message||'')){rows=[];schedule=[];rebuildFilters();draw();}$('sync-time').textContent='Synchronisation interrompue — nouvel essai automatique';$('sync-indicator').dataset.state='offline';$('sync-indicator').textContent='À reconnecter';$('status').textContent=lastSync?'La liste peut être ancienne. Vérifiez votre connexion.':'Chargement impossible. Vérifiez la connexion et la mise à jour SQL équipe.';}}
+ finally{if(generation===sessionGeneration){loading=false;$('refresh').disabled=false;if(token){armPoll();if(dirty)queueLoad(150);}}}
+}
+async function startRealtime(generation){
+ try{await client.realtime.setAuth(token);if(generation!==sessionGeneration||channel)return;
+  channel=client.channel('itbs-team',{config:{private:true}}).on('broadcast',{event:'changed'},()=>queueLoad()).subscribe(status=>{
+   if(generation!==sessionGeneration)return;realtimeReady=status==='SUBSCRIBED';setSync();armPoll();if(realtimeReady)queueLoad(0);
+  });
+ }catch{realtimeReady=false;setSync();armPoll();}
+}
+function clearSession(message=''){
+ stopScanner();sessionGeneration++;token='';userId='';rows=[];schedule=[];page=1;writeVersion++;loading=false;dirty=false;lastSync=0;realtimeReady=false;pendingAttendance.clear();clearTimeout(pollTimer);clearTimeout(loadTimer);
+ if(channel){const old=channel;channel=null;void client.removeChannel(old);}
+ $('rows').innerHTML='';$('stats').innerHTML='';$('activity').innerHTML='';$('slot').innerHTML='';$('account').textContent='';$('scan-result').textContent='';$('dashboard').hidden=true;$('login').hidden=false;$('status').textContent=message;
+}
+function acceptSession(session){
+ if(blockedSession)return;
+ if(!session){clearSession();return;}
+ if(userId===session.user.id&&token){token=session.access_token;void client.realtime.setAuth(token);return;}
+ clearSession();token=session.access_token;userId=session.user.id;$('account').textContent=session.user.email||'';$('login').hidden=true;$('dashboard').hidden=false;$('error').textContent='';
+ void load();void startRealtime(sessionGeneration);
+}
+client.auth.onAuthStateChange((_event,session)=>{setTimeout(()=>acceptSession(session),0);});
+$('login').onsubmit=async e=>{
+ e.preventDefault();$('error').textContent='';$('login-button').disabled=true;blockedSession=false;
+ const form=new FormData(e.target);remember=$('remember').checked;safeStorage('localStorage','setItem',PREFERENCE_KEY,String(remember));
+ // Le choix s’applique à la nouvelle session, jamais au mot de passe.
+ storage.removeItem(STORAGE_KEY);client.auth.startAutoRefresh();
+ try{const {data,error}=await client.auth.signInWithPassword({email:String(form.get('email')).trim(),password:String(form.get('password'))});if(error)throw error;acceptSession(data.session);}
+ catch(e){$('error').textContent=e.message||'Connexion impossible.';}
+ finally{e.target.elements.password.value='';$('login-button').disabled=false;}
+};
+$('logout').onclick=async()=>{
+ blockedSession=true;$('logout').disabled=true;
+ // scope local : ne révoque pas les sessions des autres téléphones.
+ try{await client.auth.signOut({scope:'local'});}catch{}
+ finally{client.auth.stopAutoRefresh();storage.removeItem(STORAGE_KEY);clearSession('Vous êtes déconnecté de cet appareil.');$('logout').disabled=false;}
+};
+$('activity').onchange=()=>{stopScanner();$('slot').value='';page=1;rebuildFilters();draw();};$('slot').onchange=()=>{stopScanner();page=1;draw();};
+$('previous').onclick=()=>{page--;draw();};$('next').onclick=()=>{page++;draw();};$('refresh').onclick=()=>queueLoad(0);
+$('rows').onclick=async e=>{
+ const button=e.target.closest('button[data-state]');if(!button||scanSubmitting)return;
+ const id=Number(button.dataset.id),row=rows.find(r=>r.id===id);if(!row||pendingAttendance.has(id))return;
+ const next=button.dataset.state==='present'?true:button.dataset.state==='absent'?false:null;if(row.present===next)return;
+ const generation=sessionGeneration;pendingAttendance.add(id);writeVersion++;draw();$('error').textContent='';
+ try{await request('/rest/v1/rpc/mark_present',{p_id:id,p_present:next});const current=rows.find(r=>r.id===id);if(current)current.present=next;}
+ catch(e){if(generation===sessionGeneration)$('error').textContent=e.message||'Pointage non confirmé. Réessayez.';}
+ finally{pendingAttendance.delete(id);writeVersion++;if(generation===sessionGeneration){draw();queueLoad(0);}}
+};
+$('export').onclick=()=>{
+ const safe=v=>'"'+String(v??'').replace(/^(?:[\s]*[=+@\-]|[\t\r\n])/,"'"+'$&').replaceAll('"','""')+'"';
+ const values=[['Prénom','Nom','Activité','Début','Fin','Présence'],...filtered().map(r=>[r.first_name,r.last_name,r.activity,hour(r.start),hour(r.end),r.present===true?'Présent':r.present===false?'Absent':''])];
+ const url=URL.createObjectURL(new Blob(['\ufeff'+values.map(r=>r.map(safe).join(';')).join('\r\n')],{type:'text/csv;charset=utf-8'})),a=document.createElement('a');a.href=url;a.download='ITBS-participants.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),5000);
+};
+function touchSession(){} // Les sessions sont renouvelées par Supabase Auth, sans minuterie d’inactivité locale.
 function scanMessage(message,kind=''){$('scan-result').textContent=message;$('scan-result').dataset.kind=kind;}
 function stopScanner(){
  scanEpoch++;if(scanFrame)cancelAnimationFrame(scanFrame);scanFrame=0;
@@ -34,18 +103,15 @@ function stopScanner(){
  $('scan-start').disabled=scanSubmitting;
 }
 function selectedScanSlot(){
- if(!$('activity').value||!$('slot').value)throw Error('Choisissez une activité et un créneau avant de scanner.');
- const selected=filtered(),ids=[...new Set(selected.map(r=>r.slot_id).filter(Boolean))];
- if(!selected.length)throw Error('Aucun participant dans cette séance. Actualisez la liste si nécessaire.');
- if(ids.length!==1)throw Error('Le scan nécessite la mise à jour SQL. Contactez l’organisateur.');
- return ids[0];
+ const slot=schedule.find(s=>s.id===$('slot').value&&s.activity===$('activity').value);
+ if(!slot)throw Error('Choisissez une activité et un créneau avant de scanner.');return slot.id;
 }
 async function submitScan(payload,slot){
  if(scanSubmitting||!token)return;
  const match=/^ITBS1:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(payload);
  if(!match){scanMessage('QR non reconnu. Présentez le QR du reçu ITBS.','error');return;}
  if(pendingAttendance.size){scanMessage('Un pointage est en cours. Réessayez dans un instant.','error');return;}
- const generation=sessionGeneration;scanSubmitting=true;$('scan-start').disabled=true;
+ const generation=sessionGeneration;scanSubmitting=true;writeVersion++;draw();$('scan-start').disabled=true;
  scanMessage('Vérification et enregistrement…');
  try{
   const result=await request('/rest/v1/rpc/check_in_qr',{p_reference:match[1],p_slot:slot});
@@ -53,7 +119,7 @@ async function submitScan(payload,slot){
   const row=rows.find(r=>r.id===result.id);if(row)row.present=true;draw();touchSession();
   scanMessage(`${result.already_present?'Déjà présent':'Présence enregistrée'} : ${result.first_name} ${result.last_name} · ${result.activity} · ${hour(result.start)}–${hour(result.end)}`,result.already_present?'repeat':'success');
  }catch(e){if(generation===sessionGeneration)scanMessage(e.message,'error');}
- finally{scanSubmitting=false;$('scan-start').disabled=false;$('scan-start').textContent='Scanner le suivant';}
+ finally{scanSubmitting=false;writeVersion++;if(generation===sessionGeneration){draw();queueLoad(0);}$('scan-start').disabled=false;$('scan-start').textContent='Scanner le suivant';}
 }
 $('scan-start').onclick=async()=>{
  if(scanSubmitting)return;stopScanner();let selected;
@@ -78,4 +144,9 @@ $('scan-start').onclick=async()=>{
  }catch(e){if(epoch===scanEpoch){stopScanner();scanMessage(e.name==='NotAllowedError'?'Caméra refusée. Autorisez-la dans le navigateur ou utilisez les boutons P / A / —.':'Caméra indisponible. Fermez les autres applications caméra ou utilisez les boutons P / A / —.','error');}}
 };
 $('scan-stop').onclick=()=>{stopScanner();scanMessage('Caméra fermée.');};
-document.addEventListener('visibilitychange',()=>{if(document.hidden)stopScanner();});
+document.addEventListener('visibilitychange',()=>{if(document.hidden){stopScanner();clearTimeout(pollTimer);}else if(token){queueLoad(0);armPoll();}});
+window.addEventListener('online',()=>{if(token){queueLoad(0);armPoll();}});
+window.addEventListener('offline',setSync);
+window.addEventListener('pagehide',()=>{stopScanner();clearTimeout(pollTimer);clearTimeout(loadTimer);});
+window.addEventListener('pageshow',()=>{if(token){queueLoad(0);armPoll();}});
+
